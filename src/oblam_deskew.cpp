@@ -62,6 +62,9 @@ deque<ImuMsgPtr> imu_buf;
 mutex oc_mtx;
 deque<pair<OdomMsgPtr, CloudMsgPtr>> oc_buf;
 
+std::deque<OdomMsgPtr> odom_buf;
+CloudMsgPtr cloud_hold;
+
 // An intrinsic
 myTf tf_Bimu_Blidar;
 
@@ -69,33 +72,81 @@ myTf tf_Bimu_Blidar;
 ros::Publisher distortedCloudPub;          // Publishing the distorted pointcloud in world
 ros::Publisher imuPropDeskewedCloudPub;    // Publishing the deskewed pointcloud from imu propagation
 
+template<typename T>
+double msgTimestamp(T msg) { return msg->header.stamp.toSec(); }
+
 void imuCallback(const ImuMsgPtr &imuMsg)
 {
-    mylg lock(imu_mtx); imu_buf.push_back(imuMsg);
+    mylg lock(imu_mtx);
+    imu_buf.push_back(imuMsg);
 }
 
-void odomCloudCallback(const OdomMsgPtr &odomMsg, const CloudMsgPtr &cloudMsg)
+void odomCloudCallback(const OdomMsgPtr odomMsg, const CloudMsgPtr cloudMsg)
 {
     static int skip = 10; // Skip a few pointclouds
     if (skip > 0) { skip--; return; }
-    mylg lock(oc_mtx); oc_buf.push_back(make_pair(odomMsg, cloudMsg));    
+    ROS_ASSERT(msgTimestamp(odomMsg) <= msgTimestamp(cloudMsg));
+    //ROS_INFO("Received odom/cloud pair (skip=%d)", skip);
+    oc_buf.push_back(make_pair(odomMsg, cloudMsg));    
+}
+
+void matchOdomCloud() {
+    mylg lock(oc_mtx); 
+
+    // Find odometry message right before cloud, remove as you go
+    double t = msgTimestamp(cloud_hold);
+
+    // Prune while odom_buf[1] <= t.
+    while ((2 <= odom_buf.size()) && (msgTimestamp(odom_buf[1]) <= t))
+        odom_buf.pop_front();
+
+    // We have a pair if the first odom is before t and the next odom is beyond t.
+    if ((2 <= odom_buf.size()) && (msgTimestamp(odom_buf[0]) <= t) && (t <= msgTimestamp(odom_buf[1]))) {
+        odomCloudCallback(odom_buf.front(), cloud_hold);
+        cloud_hold = nullptr;
+    }
+}
+
+void odomCallback(const OdomMsg &msg){
+    //printf("odom %.3f\n", msgTimestamp(&msg));
+    odom_buf.push_back(OdomMsgPtr(new OdomMsg(msg)));
+    if (cloud_hold)
+        matchOdomCloud();
+}
+
+void cloudCallback(const CloudMsg &msg){
+    if (cloud_hold)
+        ROS_WARN("Throwing away a pointcloud");
+    cloud_hold = CloudMsgPtr(new CloudMsg(msg));
+    if (!odom_buf.empty())
+        matchOdomCloud();
 }
 
 bool hasData()
 {
-    // Check the status of the buffers
-    if (oc_buf.empty() || imu_buf.empty())
-        return false;
-
-    if (oc_buf.front().first->header.stamp.toSec() < imu_buf.front()->header.stamp.toSec())
-    {
-        mylg lock(oc_mtx); oc_buf.pop_front();
-        printf(KRED "Deleting oc\n" RESET);
+    if (oc_buf.empty()) {
+        ROS_WARN_THROTTLE(1.0, "hasData: Odom/Cloud buffer empty");
         return false;
     }
 
-    if (oc_buf.front().first->header.stamp.toSec() + 0.125 > imu_buf.back()->header.stamp.toSec())
+    if (imu_buf.empty()) {
+        ROS_WARN_THROTTLE(1.0, "hasData: IMU buffer empty");
         return false;
+    }
+
+
+    if (msgTimestamp(oc_buf.front().first) < msgTimestamp(imu_buf.front()))
+    {
+        mylg lock(oc_mtx);
+        oc_buf.pop_front();
+        ROS_WARN("Deleting stale odom/cloud pair");
+        return false;
+    }
+
+    if (msgTimestamp(oc_buf.front().second) + 0.125 > msgTimestamp(imu_buf.back())) {
+        ROS_WARN_THROTTLE(1.0, "hasData: IMU buffer doesn't propagate far enough to cover entire point cloud");
+        return false;
+    }
 
     return true;
 }
@@ -197,10 +248,17 @@ void DeskewByImuPropagation(const CloudOusterPtr &cloudSkewed, const OdomMsgPtr 
                             vector<double> &ts, vector<Quaternd> &q_W_Bs, vector<Vector3d> &p_W_Bs)
 {
     // Skip if the number of IMU samples is low
-    if (ts.size() < 8) return;
+    if (ts.size() < 8) {
+        ROS_WARN("Short/empty IMU sequence, ignoring");
+        return;
+    }
 
     double tstart = odom_W_Bstart->header.stamp.toSec();
-    myTf tf_W_Bstart(*odom_W_Bstart);
+    double tend = tstart + cloudSkewed->points.back().t*1e-9;
+    ROS_ASSERT(ts[0] <= tstart);
+    ROS_ASSERT(tend <= ts[ts.size()-1]);
+
+    mytf tf_W_Bstart(*odom_W_Bstart);
     
     // Skewed cloud in world frame
     CloudOusterPtr cloudSkewedInWorld(new CloudOuster());
@@ -255,56 +313,74 @@ void processData()
         // Check if there is data
         if(!hasData())
         {
+            ROS_INFO_THROTTLE(1.0, "Waiting for data...");
             this_thread::sleep_for(chrono::milliseconds(50));
             continue;
         }
 
-        // Extract odom message
-        OdomMsgPtr odom = oc_buf.front().first;
-        // Extract cloud message
-        CloudMsgPtr cloudMsg = oc_buf.front().second;
-        CloudOusterPtr cloud(new CloudOuster()); pcl::fromROSMsg(*cloudMsg, *cloud);
+        OdomMsgPtr odom;
+        CloudMsgPtr cloudMsg;
         // Pop the data
-        { mylg lock(oc_mtx); oc_buf.pop_front(); }
+        { mylg lock(oc_mtx);
+          std::tie(odom, cloudMsg) = oc_buf.front();
+          oc_buf.pop_front(); }
+
+        CloudOusterPtr cloud(new CloudOuster());
+        pcl::fromROSMsg(*cloudMsg, *cloud);
+
         // Convert cloud to body frame
         pcl::transformPointCloud(*cloud, *cloud, tf_Bimu_Blidar.cast<float>().tfMat());
 
-        double start_time = cloudMsg->header.stamp.toSec();
-        double end_time = start_time + cloud->points.back().t/1.0e9;
+        double start_time = odom->header.stamp.toSec();
+        double end_time = cloudMsg->header.stamp.toSec() + cloud->points.back().t/1.0e9;
 
-        deque<ImuMsgPtr> imuSeq(1, imu_buf.front());
-        while(ros::ok())
+        //for(unsigned int i = 1; i < imu_buf.size(); i++)
+        //    ROS_ASSERT(imu_buf[i]->header.stamp.toSec() > imu_buf[i-1]->header.stamp.toSec());
+
+
+        deque<ImuMsgPtr> imuSeq;
         {
-            double sample_time = imu_buf.front()->header.stamp.toSec();
+            mylg lock(imu_mtx); 
+            while (2 <= imu_buf.size() && msgTimestamp(imu_buf[1]) <= start_time)
+                imu_buf.pop_front();
 
-            if (sample_time <= start_time)
-                imuSeq.front() = imu_buf.front();
-            else if(start_time < sample_time && sample_time < end_time)
-                imuSeq.push_back(imu_buf.front());
-            else if(sample_time >= end_time)
+            for (const auto& sample : imu_buf)
             {
-                ImuMsgPtr final_sample = imu_buf.front();
-                mylg lock(imu_mtx);
-                if (!imuSeq.empty())
-                    imu_buf.push_front(imuSeq.back());
-                imuSeq.push_back(final_sample);
-                break;
+                imuSeq.push_back(sample);
+                if (end_time < msgTimestamp(sample))
+                    break;
             }
+        }
 
-            mylg lock(imu_mtx); imu_buf.pop_front();
+        if ((imuSeq.size() < 2) || imuSeq.back()->header.stamp.toSec() < start_time) {
+            ROS_WARN_THROTTLE(1.0,
+                              ("Pointcloud timestamp outside of IMU buffer "
+                               "window. Cloud: %.3f -> %.3f, IMU buffer: %.3f "
+                               "-> %.3f, imu_buf.size() = %lu, imuSeq.size() = "
+                               "%lu"),
+                             start_time,
+                             end_time,
+                             imu_buf.front()->header.stamp.toSec(),
+                             imu_buf.back()->header.stamp.toSec(),
+                             imu_buf.size(),
+                             imuSeq.size());
+            continue;
         }
 
         // Check ordering consistency
         ROS_ASSERT(imuSeq.size() > 1);
-        for(int i = 1; i < imuSeq.size(); i++)
+        for(unsigned int i = 1; i < imuSeq.size(); i++)
             ROS_ASSERT(imuSeq[i]->header.stamp.toSec() > imuSeq[i-1]->header.stamp.toSec());
 
         // Write a report
         static int cloudCount = -1; cloudCount++;
-        printf("Count %3d, %3d. Odom: %.3f. Cloud: %.3f -> %.3f. Imu: %3d, %.3f -> %.3f. Buf: OC: %3d. Imu: %d\n",
-                cloudCount, cloudMsg->header.seq,
-                odom->header.stamp.toSec(), start_time, end_time,
-                imuSeq.front()->header.stamp.toSec(), imuSeq.back()->header.stamp.toSec(), imuSeq.size(),
+        printf(("Count %3d, %3d. Odom: %.3f. "
+                "Cloud: %.3f -> %.3f. "
+                "Imu: %lu, %.3f -> %.3f. "
+                "Buf: OC: %3lu. Imu: %lu\n"),
+                cloudCount, cloudMsg->header.seq, odom->header.stamp.toSec(),
+                start_time, end_time,
+                imuSeq.size(), imuSeq.front()->header.stamp.toSec(), imuSeq.back()->header.stamp.toSec(),
                 oc_buf.size(), imu_buf.size());
         int imuCount = -1; imuCount++;
         // for (auto &imuSample : imuSeq)
@@ -360,23 +436,28 @@ int main(int argc, char **argv)
     ros::Subscriber imuSub = nh.subscribe("/os1_cloud_node/imu", 1000, imuCallback);
 
     // Subscribe to the odometry and pointcloud topics
-    message_filters::Subscriber<OdomMsg> odomSub(nh, "/odometry/filtered", 100);
-    message_filters::Subscriber<CloudMsg> cloudSub(nh, "/os1_cloud_node/points", 100);
+    ros::Subscriber odomSub = nh.subscribe("/odometry/filtered", 100, odomCallback);
+    ros::Subscriber cloudSub = nh.subscribe("/os1_cloud_node/points", 100, cloudCallback);
 
     // Advertise the pointclouds
     distortedCloudPub = nh.advertise<CloudMsg>("/distorted_cloud", 100);
     imuPropDeskewedCloudPub = nh.advertise<CloudMsg>("/imu_propagated_deskewed_cloud", 100);
 
     // Create synchronized callback of two topics
-    typedef sync_policies::ApproximateTime<OdomMsg, CloudMsg> MySyncPolicy;
-    Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), odomSub, cloudSub);
-    sync.registerCallback(boost::bind(&odomCloudCallback, _1, _2));
+    //typedef sync_policies::ApproximateTime<OdomMsg, CloudMsg> MySyncPolicy;
+    //Synchronizer<MySyncPolicy> sync(MySyncPolicy(sync_time),
+    //                                odomSub, cloudSub);
+    //sync.registerCallback(boost::bind(&odomCloudCallback, _1, _2));
 
     // Process the data
     thread processDataThread(processData); // For processing the image
 
-    ros::MultiThreadedSpinner spinner(0);
-    spinner.spin();
+    ros::spin();
+
+    //ros::MultiThreadedSpinner spinner(0);
+    //spinner.spin();
+
+    ROS_ERROR("Reached end!");
 
     return 0;
 }
